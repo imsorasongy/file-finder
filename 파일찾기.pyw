@@ -71,6 +71,10 @@ def extract_text_from_file(filepath, max_bytes):
     if ext == 'hwp':
         try:
             import olefile, zlib, re
+        except ImportError:
+            return None
+        ole = None
+        try:
             ole = olefile.OleFileIO(filepath)
             texts = []
             if ole.exists('PrvText'):
@@ -107,10 +111,15 @@ def extract_text_from_file(filepath, max_bytes):
                         texts.append(cleaned)
                     except Exception:
                         continue
-            ole.close()
             return '\n'.join(texts) if texts else None
         except Exception:
             return None
+        finally:
+            if ole is not None:
+                try:
+                    ole.close()
+                except Exception:
+                    pass
 
     if ext == 'docx':
         try:
@@ -199,6 +208,10 @@ def extract_preview_text(filepath, max_bytes):
         # PrvText만 (이미 본문 요약, 빠름)
         try:
             import olefile
+        except ImportError:
+            return None
+        ole = None
+        try:
             ole = olefile.OleFileIO(filepath)
             txt = ''
             if ole.exists('PrvText'):
@@ -207,10 +220,15 @@ def extract_preview_text(filepath, max_bytes):
                     txt = raw.decode('utf-16-le', errors='ignore')
                 except Exception:
                     pass
-            ole.close()
             return txt if txt else None
         except Exception:
             return None
+        finally:
+            if ole is not None:
+                try:
+                    ole.close()
+                except Exception:
+                    pass
 
     if ext == 'docx':
         try:
@@ -293,19 +311,59 @@ def render_pdf_first_page_as_image(filepath, zoom=2.0):
         return None
 
 
+def _is_unsafe_zip_path(entry_path):
+    """경로 탈출(..) 또는 절대경로를 가진 엔트리인지 확인."""
+    norm = entry_path.replace('\\', '/')
+    if norm.startswith('/'):
+        return True
+    if len(norm) >= 2 and norm[1] == ':':  # Windows 드라이브
+        return True
+    parts = norm.split('/')
+    return any(p == '..' for p in parts)
+
+
+def _is_zipbomb_suspect(info, max_expanded_bytes=500 * 1024 * 1024):
+    """압축률이 극단적이거나 해제 후 크기가 매우 큰 엔트리 감지."""
+    if info.file_size > max_expanded_bytes:
+        return True
+    if info.compress_size > 0:
+        ratio = info.file_size / info.compress_size
+        # 비정상적으로 높은 압축률 + 해제 후 50MB 초과
+        if ratio > 200 and info.file_size > 50 * 1024 * 1024:
+            return True
+    return False
+
+
 def search_zip_entries(zip_path, name_q, content_q, case_sensitive, exts, max_bytes):
     """ZIP 파일 내부 엔트리를 검색. 매치된 엔트리 리스트 반환 (또는 None on error)."""
     import zipfile
     import tempfile
 
+    MAX_TOTAL_EXPANDED = 2 * 1024 * 1024 * 1024  # 전체 해제 예상 크기 2GB 상한
+
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             matches = []
             name_q_cmp = name_q if case_sensitive else name_q.lower()
+
+            # 전체 해제 크기 누적 제한
+            total_expanded = 0
+            for info in zf.infolist():
+                if info.file_size > 0:
+                    total_expanded += info.file_size
+                if total_expanded > MAX_TOTAL_EXPANDED:
+                    return None  # 전체 크기 의심스러우면 중단
+
             for info in zf.infolist():
                 if info.is_dir():
                     continue
                 entry_path = info.filename
+                # 경로 탈출·절대경로 차단
+                if _is_unsafe_zip_path(entry_path):
+                    continue
+                # ZIP bomb 의심 엔트리 차단
+                if _is_zipbomb_suspect(info):
+                    continue
                 entry_name = entry_path.rsplit('/', 1)[-1] if '/' in entry_path else entry_path
                 ext = entry_name.rsplit('.', 1)[-1].lower() if '.' in entry_name else ''
 
@@ -721,14 +779,53 @@ class IndexManager:
                 sql += " WHERE " + " AND ".join(all_where)
             sql += f" LIMIT {int(limit)}"
 
-            rows = conn.execute(sql, all_params).fetchall()
+            try:
+                rows = conn.execute(sql, all_params).fetchall()
+            except sqlite3.OperationalError:
+                # FTS5 구문 오류 (특수문자 조합 등) — LIKE 폴백으로 재시도
+                rows = self._search_like_fallback(
+                    conn, name_q, ext_q, content_q, case_sensitive, limit
+                )
             return rows
         finally:
             conn.close()
 
+    def _search_like_fallback(self, conn, name_q, ext_q, content_q,
+                               case_sensitive, limit):
+        """FTS MATCH 실패 시 LIKE로 안전하게 재실행."""
+        where = []
+        params = []
+        collate = '' if case_sensitive else ' COLLATE NOCASE'
+        if name_q:
+            where.append(f"files.name LIKE ?{collate}")
+            params.append(f'%{name_q}%')
+        if content_q:
+            where.append(f"files_fts.content LIKE ?{collate}")
+            params.append(f'%{content_q}%')
+        if ext_q:
+            exts = [e.strip().lstrip('.').lower() for e in ext_q.split(',') if e.strip()]
+            if exts:
+                ph = ','.join('?' * len(exts))
+                where.append(f"files.ext IN ({ph})")
+                params.extend(exts)
+        sql = ("SELECT files.path, files.name, files.size, files.mtime, "
+               "CASE WHEN ? != '' THEN substr(files_fts.content, "
+               "  max(1, instr(lower(files_fts.content), lower(?)) - 30), 120) "
+               "ELSE '' END "
+               "FROM files_fts JOIN files ON files.id = files_fts.rowid")
+        # snippet용 파라미터 (앞에 2개)
+        sql_params = [content_q or '', content_q or '']
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" LIMIT {int(limit)}"
+        return conn.execute(sql, sql_params + params).fetchall()
+
     @staticmethod
     def _escape_fts(s):
-        return s.replace('"', '""')
+        """FTS5 phrase 내부에서 안전하게 사용하도록 이스케이프.
+        phrase는 "..." 안에서 '"' → '""'만 이스케이프하면 됨.
+        """
+        return s.replace('"', '""').replace('\x00', '')
 
     def remove_paths(self, paths):
         """파일이 이동/삭제된 경우 색인에서 제거."""
@@ -1524,15 +1621,24 @@ class FileFinderApp:
             t0 = time.time()
             rows = self.index_mgr.search(name_q, ext_q, content_q, case_sensitive)
             elapsed = time.time() - t0
-            for path, name, size, mtime, snippet in rows:
+            total = len(rows)
+            for i, (path, name, size, mtime, snippet) in enumerate(rows, 1):
                 if self.stop_flag.is_set():
                     break
                 root_dir = os.path.dirname(path)
                 self.results.append((name, root_dir, size or 0, mtime or 0, snippet or ''))
-            self.root.after(0, self._finish_index_search, elapsed, len(rows))
+                # 500건마다 UI에 점진 표시
+                if i % 500 == 0:
+                    self.root.after(0, self._flush_index_progress, i, total)
+            self.root.after(0, self._finish_index_search, elapsed, total)
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("오류", f"색인 검색 오류: {e}"))
             self.root.after(0, self._finish_index_search, 0, 0)
+
+    def _flush_index_progress(self, shown, total):
+        self._flush_results()
+        self.status_var.set(f"색인 검색 중... {shown:,} / {total:,}")
+        self.count_var.set(f"{shown:,}건")
 
     def _finish_index_search(self, elapsed, count):
         self._flush_results()
@@ -1966,6 +2072,13 @@ class FileFinderApp:
         self.root.after(0, self._preview_show_text, fp, text, hits, meta, token)
 
     def _show_text_mode(self):
+        # 이미지 참조와 캔버스 바인딩 정리 (메모리 누수 방지)
+        try:
+            self.preview_canvas.unbind('<Configure>')
+            self.preview_canvas.delete('all')
+        except Exception:
+            pass
+        self._preview_image_ref = None
         self.preview_canvas.pack_forget()
         if not self.preview_text.winfo_ismapped():
             self.preview_text.pack(side='left', fill='both', expand=True)
@@ -2005,8 +2118,12 @@ class FileFinderApp:
         self._show_image_mode()
         self.preview_header.configure(text=os.path.basename(fp), foreground='#111')
         self.preview_meta.configure(text=meta)
+        # 이전 바인딩 해제 후 새로 바인딩 (중복 핸들러 누적 방지)
+        try:
+            self.preview_canvas.unbind('<Configure>')
+        except Exception:
+            pass
         self._render_image_fitted(img)
-        # 창 크기 변경 시 재조정
         self.preview_canvas.bind(
             '<Configure>',
             lambda e, i=img: self._render_image_fitted(i)
