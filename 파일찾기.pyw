@@ -168,6 +168,108 @@ def extract_text_from_file(filepath, max_bytes):
     return None
 
 
+def extract_preview_text(filepath, max_bytes):
+    """빠른 미리보기용 — 앞쪽 페이지/섹션만 추출."""
+    ext = filepath.rsplit('.', 1)[-1].lower() if '.' in filepath else ''
+    if ext in BINARY_SKIP_EXTENSIONS:
+        return None
+    try:
+        fsize = os.path.getsize(filepath)
+    except OSError:
+        return None
+    if fsize > max_bytes:
+        return None
+
+    if ext == 'pdf':
+        try:
+            from pypdf import PdfReader
+            r = PdfReader(filepath)
+            parts = []
+            for p in r.pages[:3]:
+                try:
+                    parts.append(p.extract_text() or '')
+                except Exception:
+                    continue
+            return '\n'.join(parts)
+        except Exception:
+            return None
+
+    if ext == 'hwp':
+        # PrvText만 (이미 본문 요약, 빠름)
+        try:
+            import olefile
+            ole = olefile.OleFileIO(filepath)
+            txt = ''
+            if ole.exists('PrvText'):
+                try:
+                    raw = ole.openstream('PrvText').read()
+                    txt = raw.decode('utf-16-le', errors='ignore')
+                except Exception:
+                    pass
+            ole.close()
+            return txt if txt else None
+        except Exception:
+            return None
+
+    if ext == 'docx':
+        try:
+            from docx import Document
+            doc = Document(filepath)
+            parts = []
+            for i, p in enumerate(doc.paragraphs):
+                if i >= 100:
+                    break
+                parts.append(p.text)
+            return '\n'.join(parts)
+        except Exception:
+            return None
+
+    if ext == 'pptx':
+        try:
+            from pptx import Presentation
+            prs = Presentation(filepath)
+            parts = []
+            for i, slide in enumerate(prs.slides):
+                if i >= 5:
+                    break
+                for sh in slide.shapes:
+                    if sh.has_text_frame:
+                        parts.append(sh.text_frame.text)
+            return '\n'.join(parts)
+        except Exception:
+            return None
+
+    if ext == 'xlsx':
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(filepath, data_only=True, read_only=True)
+            parts = []
+            if wb.worksheets:
+                sheet = wb.worksheets[0]
+                for i, row in enumerate(sheet.iter_rows(values_only=True)):
+                    if i >= 100:
+                        break
+                    parts.append(' '.join(str(v) for v in row if v is not None))
+            wb.close()
+            return '\n'.join(parts)
+        except Exception:
+            return None
+
+    # 텍스트 — 앞 100KB만 읽음
+    if ext in TEXT_EXTENSIONS or ext == '':
+        try:
+            with open(filepath, 'rb') as f:
+                raw = f.read(100_000)
+            for enc in ('utf-8-sig', 'utf-8', 'cp949', 'euc-kr', 'latin-1'):
+                try:
+                    return raw.decode(enc)
+                except UnicodeDecodeError:
+                    continue
+        except Exception:
+            return None
+    return None
+
+
 def find_snippet(text, query, case_sensitive, ctx_before=40, ctx_after=80):
     if not text or not query:
         return None
@@ -754,13 +856,15 @@ class FileFinderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("파일 찾기")
-        self.root.geometry("1180x720")
-        self.root.minsize(820, 520)
+        self.root.geometry("1200x840")
+        self.root.minsize(820, 600)
 
         self.search_thread = None
         self.stop_flag = threading.Event()
         self.results = []
         self.index_mgr = IndexManager()
+        self._preview_token = 0
+        self._preview_image_ref = None  # Prevent GC
 
         self._build_ui()
         self.root.bind('<Escape>', lambda e: self._stop_search())
@@ -840,8 +944,12 @@ class FileFinderApp:
 
         ttk.Separator(self.root, orient='horizontal').pack(fill='x', padx=12, pady=(4, 0))
 
-        mid = ttk.Frame(self.root, padding=(12, 8, 12, 6))
-        mid.pack(fill='both', expand=True)
+        # 결과 + 미리보기 — 수직 분할
+        paned = ttk.PanedWindow(self.root, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=12, pady=(8, 6))
+
+        mid = ttk.Frame(paned)
+        paned.add(mid, weight=3)
 
         cols = ('name', 'path', 'size', 'modified', 'snippet')
         self.tree = ttk.Treeview(mid, columns=cols, show='headings', selectmode='extended')
@@ -862,6 +970,56 @@ class FileFinderApp:
         vsb.pack(side='right', fill='y')
 
         self.tree.bind('<Double-Button-1>', self._open_in_explorer)
+        self.tree.bind('<<TreeviewSelect>>', self._on_select)
+
+        # 미리보기 패널
+        preview = ttk.LabelFrame(paned, text=" 미리보기 ", padding=(8, 6, 8, 8))
+        paned.add(preview, weight=2)
+
+        header_frame = ttk.Frame(preview)
+        header_frame.pack(fill='x')
+        self.preview_header = ttk.Label(
+            header_frame,
+            text="결과를 선택하면 미리보기가 표시됩니다  ·  (텍스트 / HWP / PDF / DOCX / PPTX / XLSX / 이미지)",
+            foreground='#888'
+        )
+        self.preview_header.pack(side='left')
+        self.preview_meta = ttk.Label(header_frame, text="", foreground='#666')
+        self.preview_meta.pack(side='right')
+
+        ttk.Separator(preview, orient='horizontal').pack(fill='x', pady=(4, 6))
+
+        # Text + Canvas 스택 (이미지일 때는 Canvas 사용)
+        self.preview_container = ttk.Frame(preview)
+        self.preview_container.pack(fill='both', expand=True)
+
+        self.preview_text = tk.Text(
+            self.preview_container, wrap='word', state='disabled',
+            font=('맑은 고딕', 10), relief='flat',
+            background='#FCFCFC', foreground='#111',
+            padx=6, pady=4
+        )
+        self.preview_sb = ttk.Scrollbar(
+            self.preview_container, orient='vertical',
+            command=self.preview_text.yview
+        )
+        self.preview_text.configure(yscrollcommand=self.preview_sb.set)
+        self.preview_text.pack(side='left', fill='both', expand=True)
+        self.preview_sb.pack(side='right', fill='y')
+
+        self.preview_canvas = tk.Canvas(
+            self.preview_container, background='#1A1A1A',
+            highlightthickness=0
+        )
+        # Canvas는 이미지 표시 시 pack
+
+        # 하이라이트 태그
+        self.preview_text.tag_configure(
+            'hit', background='#FFE27A', foreground='#000'
+        )
+        self.preview_text.tag_configure(
+            'dim', foreground='#888', font=('맑은 고딕', 9, 'italic')
+        )
 
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label="탐색기에서 열기", command=self._open_in_explorer)
@@ -1193,6 +1351,231 @@ class FileFinderApp:
                 self.menu.tk_popup(event.x_root, event.y_root)
             finally:
                 self.menu.grab_release()
+
+    # ===== 미리보기 =====
+    IMAGE_EXTS = {'png', 'gif', 'jpg', 'jpeg', 'bmp', 'webp', 'tiff', 'tif', 'ico'}
+    PREVIEW_MAX_CHARS = 50_000
+    PREVIEW_MAX_FILE_MB = 50
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        vals = self.tree.item(sel[0], 'values')
+        if not vals:
+            return
+        fp = os.path.join(vals[1], vals[0])
+
+        self._preview_token += 1
+        token = self._preview_token
+
+        fname = os.path.basename(fp)
+        self.preview_header.configure(text=f"{fname}  ·  로딩 중...", foreground='#444')
+        self.preview_meta.configure(text='')
+        self._show_text_mode()
+        self._set_preview_text('', [])
+
+        threading.Thread(
+            target=self._load_preview, args=(fp, token), daemon=True
+        ).start()
+
+    def _load_preview(self, fp, token):
+        try:
+            st = os.stat(fp)
+        except OSError as e:
+            self.root.after(0, self._preview_error, fp, f"파일 읽기 실패: {e}", token)
+            return
+
+        ext = fp.rsplit('.', 1)[-1].lower() if '.' in fp else ''
+        size_mb = st.st_size / (1024 * 1024)
+
+        # 이미지
+        if ext in self.IMAGE_EXTS:
+            if size_mb > 30:
+                self.root.after(0, self._preview_error, fp,
+                                f"이미지가 큽니다 ({size_mb:.1f} MB) — 미리보기 생략", token)
+                return
+            try:
+                from PIL import Image
+                img = Image.open(fp)
+                img.load()
+                # 메타데이터
+                meta = f"{img.format} · {img.width}×{img.height} · {self._fmt_size(st.st_size)}"
+                if token != self._preview_token:
+                    return
+                self.root.after(0, self._preview_show_image, fp, img, meta, token)
+            except Exception as e:
+                self.root.after(0, self._preview_error, fp, f"이미지 로드 실패: {e}", token)
+            return
+
+        # 텍스트/문서
+        max_bytes = int(self.PREVIEW_MAX_FILE_MB * 1024 * 1024)
+        if size_mb > self.PREVIEW_MAX_FILE_MB:
+            self.root.after(
+                0, self._preview_error, fp,
+                f"파일이 너무 큽니다 ({size_mb:.1f} MB > {self.PREVIEW_MAX_FILE_MB} MB) — 미리보기 생략",
+                token
+            )
+            return
+
+        # 1단계: 빠른 미리보기 (앞 페이지/섹션만)
+        text = extract_preview_text(fp, max_bytes)
+        is_partial = True
+
+        # 검색어 목록
+        queries = []
+        content_q = self.content_var.get().strip()
+        name_q = self.name_var.get().strip()
+        for q in (content_q, name_q):
+            if q:
+                queries.append(q)
+
+        case_sensitive = self.case_var.get()
+
+        # 2단계: 검색어가 있는데 빠른 미리보기에 안 보이면 전체 추출
+        if queries and text is not None:
+            haystack = text if case_sensitive else text.lower()
+            missing = [q for q in queries
+                       if (q if case_sensitive else q.lower()) not in haystack]
+            if missing:
+                if token != self._preview_token:
+                    return
+                self.root.after(
+                    0, lambda: self.preview_meta.configure(
+                        text="검색어 확인을 위해 전체 내용 로드 중..."
+                    )
+                )
+                full_text = extract_text_from_file(fp, max_bytes)
+                if full_text is not None:
+                    text = full_text
+                    is_partial = False
+
+        # 빠른 미리보기가 None이면 전체라도 시도
+        if text is None:
+            text = extract_text_from_file(fp, max_bytes)
+            is_partial = False
+
+        if text is None:
+            self.root.after(
+                0, self._preview_error, fp,
+                "(지원하지 않는 형식이거나 텍스트 추출 실패)",
+                token
+            )
+            return
+
+        truncated = False
+        if len(text) > self.PREVIEW_MAX_CHARS:
+            text = text[:self.PREVIEW_MAX_CHARS]
+            truncated = True
+
+        # 검색어 위치
+        hits = []
+        if queries:
+            haystack = text if case_sensitive else text.lower()
+            for q in queries:
+                needle = q if case_sensitive else q.lower()
+                start = 0
+                while True:
+                    idx = haystack.find(needle, start)
+                    if idx < 0:
+                        break
+                    hits.append((idx, idx + len(q)))
+                    start = idx + len(q)
+                    if len(hits) > 500:
+                        break
+
+        if token != self._preview_token:
+            return
+        meta = f"{self._fmt_size(st.st_size)}  ·  {datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')}"
+        if is_partial:
+            meta += "  ·  빠른 미리보기"
+        if truncated:
+            meta += "  ·  5만자 이후 생략"
+        self.root.after(0, self._preview_show_text, fp, text, hits, meta, token)
+
+    def _show_text_mode(self):
+        self.preview_canvas.pack_forget()
+        if not self.preview_text.winfo_ismapped():
+            self.preview_text.pack(side='left', fill='both', expand=True)
+            self.preview_sb.pack(side='right', fill='y')
+
+    def _show_image_mode(self):
+        self.preview_text.pack_forget()
+        self.preview_sb.pack_forget()
+        if not self.preview_canvas.winfo_ismapped():
+            self.preview_canvas.pack(fill='both', expand=True)
+
+    def _preview_show_text(self, fp, text, hits, meta, token):
+        if token != self._preview_token:
+            return
+        self._show_text_mode()
+        self.preview_header.configure(text=os.path.basename(fp), foreground='#111')
+        self.preview_meta.configure(text=meta)
+        self._set_preview_text(text, hits)
+
+    def _set_preview_text(self, text, hits):
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', 'end')
+        self.preview_text.insert('1.0', text)
+        # 하이라이트
+        if hits and text:
+            for start, end in hits:
+                start_idx = f"1.0+{start}c"
+                end_idx = f"1.0+{end}c"
+                self.preview_text.tag_add('hit', start_idx, end_idx)
+            # 첫 매치로 스크롤
+            self.preview_text.see(f"1.0+{hits[0][0]}c")
+        self.preview_text.configure(state='disabled')
+
+    def _preview_show_image(self, fp, img, meta, token):
+        if token != self._preview_token:
+            return
+        self._show_image_mode()
+        self.preview_header.configure(text=os.path.basename(fp), foreground='#111')
+        self.preview_meta.configure(text=meta)
+        self._render_image_fitted(img)
+        # 창 크기 변경 시 재조정
+        self.preview_canvas.bind(
+            '<Configure>',
+            lambda e, i=img: self._render_image_fitted(i)
+        )
+
+    def _render_image_fitted(self, img):
+        try:
+            from PIL import ImageTk
+            cw = max(self.preview_canvas.winfo_width(), 100)
+            ch = max(self.preview_canvas.winfo_height(), 100)
+            # 비율 유지
+            iw, ih = img.size
+            scale = min(cw / iw, ch / ih, 1.0)
+            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+            resized = img.resize((nw, nh))
+            photo = ImageTk.PhotoImage(resized)
+            self._preview_image_ref = photo  # keep reference
+            self.preview_canvas.delete('all')
+            self.preview_canvas.create_image(cw // 2, ch // 2, anchor='center', image=photo)
+        except Exception as e:
+            self.preview_canvas.delete('all')
+            self.preview_canvas.create_text(
+                50, 50, anchor='nw',
+                text=f"이미지 표시 실패: {e}", fill='#FFF', font=('맑은 고딕', 10)
+            )
+
+    def _preview_error(self, fp, msg, token):
+        if token != self._preview_token:
+            return
+        self._show_text_mode()
+        try:
+            st = os.stat(fp)
+            meta = f"{self._fmt_size(st.st_size)}  ·  {datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')}"
+        except Exception:
+            meta = ''
+        self.preview_header.configure(text=os.path.basename(fp), foreground='#111')
+        self.preview_meta.configure(text=meta)
+        self.preview_text.configure(state='normal')
+        self.preview_text.delete('1.0', 'end')
+        self.preview_text.insert('1.0', msg, 'dim')
+        self.preview_text.configure(state='disabled')
 
 
 def main():
