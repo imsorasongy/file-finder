@@ -3,6 +3,7 @@ from tkinter import ttk, filedialog, messagebox
 import os
 import sys
 import time
+import shutil
 import threading
 import subprocess
 import sqlite3
@@ -646,6 +647,37 @@ class IndexManager:
     def _escape_fts(s):
         return s.replace('"', '""')
 
+    def remove_paths(self, paths):
+        """파일이 이동/삭제된 경우 색인에서 제거."""
+        if not paths:
+            return 0
+        conn = self._connect()
+        try:
+            removed = 0
+            for p in paths:
+                row = conn.execute("SELECT id FROM files WHERE path = ?", (p,)).fetchone()
+                if row:
+                    fid = row[0]
+                    conn.execute("DELETE FROM files_fts WHERE rowid = ?", (fid,))
+                    conn.execute("DELETE FROM files WHERE id = ?", (fid,))
+                    removed += 1
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+
+    def update_path(self, old_path, new_path):
+        """파일 이동 시 경로만 업데이트 (내용 재추출 없음)."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE files SET path = ?, name = ? WHERE path = ?",
+                (new_path, os.path.basename(new_path), old_path)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # ============================================================
 # 색인 관리 대화상자
@@ -872,6 +904,251 @@ class IndexDialog(tk.Toplevel):
 
 
 # ============================================================
+# 파일 이동/복사 대화상자
+# ============================================================
+def resolve_conflict(dest_path):
+    """충돌 시 '이름 (1).ext', '(2)' 식으로 접미사 부여."""
+    if not os.path.exists(dest_path):
+        return dest_path
+    base, ext = os.path.splitext(dest_path)
+    i = 1
+    while True:
+        candidate = f"{base} ({i}){ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
+class MoveCopyDialog(tk.Toplevel):
+    def __init__(self, parent, file_paths, index_mgr, on_complete=None):
+        super().__init__(parent)
+        self.title("파일 이동 / 복사")
+        self.geometry("680x540")
+        self.transient(parent)
+        self.resizable(True, True)
+
+        self.file_paths = list(file_paths)
+        self.index_mgr = index_mgr
+        self.on_complete = on_complete
+        self.stop_flag = threading.Event()
+        self.worker = None
+        self.result_paths = []  # 처리된 원본 경로 (트리에서 제거할 파일)
+        self.moved_map = {}     # 원본 → 새 경로
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _build_ui(self):
+        pad = 12
+
+        # 대상 폴더
+        dest_frame = ttk.LabelFrame(self, text=" 대상 위치 ", padding=pad)
+        dest_frame.pack(fill='x', padx=pad, pady=(pad, 6))
+
+        r1 = ttk.Frame(dest_frame)
+        r1.pack(fill='x', pady=3)
+        ttk.Label(r1, text="대상 폴더", width=12).pack(side='left')
+        self.dest_var = tk.StringVar(value=str(Path.home()))
+        ttk.Entry(r1, textvariable=self.dest_var).pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(r1, text="찾아보기", command=self._browse_dest, width=10).pack(side='left')
+
+        r2 = ttk.Frame(dest_frame)
+        r2.pack(fill='x', pady=3)
+        ttk.Label(r2, text="새 폴더 이름", width=12).pack(side='left')
+        self.newfolder_var = tk.StringVar(value="")
+        ttk.Entry(r2, textvariable=self.newfolder_var).pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Label(r2, text="(비우면 대상 폴더에 바로)", foreground='#888').pack(side='left')
+
+        # 옵션
+        op_frame = ttk.LabelFrame(self, text=" 작업 방식 ", padding=pad)
+        op_frame.pack(fill='x', padx=pad, pady=6)
+        self.op_var = tk.StringVar(value='move')
+        ttk.Radiobutton(op_frame, text="이동 (원본 삭제)",
+                        variable=self.op_var, value='move').pack(side='left', padx=(0, 16))
+        ttk.Radiobutton(op_frame, text="복사 (원본 유지)",
+                        variable=self.op_var, value='copy').pack(side='left')
+
+        # 파일 목록
+        list_frame = ttk.LabelFrame(
+            self, text=f" 처리 대상 ({len(self.file_paths)}개) ", padding=pad
+        )
+        list_frame.pack(fill='both', expand=True, padx=pad, pady=6)
+
+        lf_inner = ttk.Frame(list_frame)
+        lf_inner.pack(fill='both', expand=True)
+        self.listbox = tk.Listbox(lf_inner, font=('맑은 고딕', 9))
+        sb = ttk.Scrollbar(lf_inner, orient='vertical', command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        for p in self.file_paths:
+            self.listbox.insert('end', p)
+
+        # 진행
+        prog_frame = ttk.Frame(self, padding=(pad, 4, pad, 4))
+        prog_frame.pack(fill='x')
+        self.progress_label = ttk.Label(prog_frame, text="대기 중", foreground='#666')
+        self.progress_label.pack(anchor='w')
+        self.progress = ttk.Progressbar(prog_frame, mode='determinate')
+        self.progress.pack(fill='x', pady=(4, 0))
+
+        # 버튼
+        btns = ttk.Frame(self, padding=(pad, 4, pad, pad))
+        btns.pack(fill='x')
+        self.run_btn = ttk.Button(btns, text="실행", command=self._start, width=12)
+        self.run_btn.pack(side='right', padx=(6, 0))
+        self.cancel_btn = ttk.Button(btns, text="취소/닫기", command=self._close, width=12)
+        self.cancel_btn.pack(side='right')
+
+    def _browse_dest(self):
+        d = filedialog.askdirectory(parent=self, initialdir=self.dest_var.get() or str(Path.home()))
+        if d:
+            self.dest_var.set(os.path.normpath(d))
+
+    def _start(self):
+        if self.worker and self.worker.is_alive():
+            return
+        dest = self.dest_var.get().strip()
+        if not dest or not os.path.isdir(dest):
+            messagebox.showerror("오류", "대상 폴더가 존재하지 않습니다.", parent=self)
+            return
+        new_folder = self.newfolder_var.get().strip()
+        op = self.op_var.get()
+
+        # 최종 대상 경로
+        if new_folder:
+            # 금지 문자 제거
+            invalid = '<>:"/\\|?*'
+            if any(c in new_folder for c in invalid):
+                messagebox.showerror(
+                    "오류", f"폴더 이름에 사용할 수 없는 문자가 포함되어 있습니다:\n{invalid}",
+                    parent=self
+                )
+                return
+            final_dest = os.path.join(dest, new_folder)
+        else:
+            final_dest = dest
+
+        # 원본 = 대상 경로인 파일 체크
+        conflicts = []
+        for p in self.file_paths:
+            if os.path.normcase(os.path.dirname(p)) == os.path.normcase(final_dest):
+                conflicts.append(p)
+        if conflicts:
+            if not messagebox.askyesno(
+                "확인",
+                f"{len(conflicts)}개 파일이 이미 대상 폴더에 있습니다. 건너뛰고 진행할까요?",
+                parent=self
+            ):
+                return
+
+        verb = '이동' if op == 'move' else '복사'
+        if not messagebox.askyesno(
+            "확인",
+            f"{len(self.file_paths)}개 파일을 다음 위치로 {verb}합니다:\n\n{final_dest}\n\n계속할까요?",
+            parent=self
+        ):
+            return
+
+        # 폴더 생성
+        try:
+            os.makedirs(final_dest, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("오류", f"폴더 생성 실패: {e}", parent=self)
+            return
+
+        self.stop_flag.clear()
+        self.run_btn.configure(state='disabled')
+        self.progress.configure(maximum=len(self.file_paths), value=0)
+        self.progress_label.configure(text=f"{verb} 중...")
+
+        self.worker = threading.Thread(
+            target=self._work, args=(final_dest, op, conflicts), daemon=True
+        )
+        self.worker.start()
+
+    def _work(self, final_dest, op, skip_list):
+        skip_set = set(os.path.normcase(p) for p in skip_list)
+        succeeded = 0
+        failed = 0
+        skipped = 0
+        errors = []
+
+        for i, src in enumerate(self.file_paths, 1):
+            if self.stop_flag.is_set():
+                break
+            if os.path.normcase(src) in skip_set:
+                skipped += 1
+                self._update_progress(i, f"건너뜀: {os.path.basename(src)}")
+                continue
+            if not os.path.exists(src):
+                failed += 1
+                errors.append(f"없음: {src}")
+                self._update_progress(i, f"없음: {os.path.basename(src)}")
+                continue
+
+            dest = os.path.join(final_dest, os.path.basename(src))
+            dest = resolve_conflict(dest)
+
+            try:
+                if op == 'move':
+                    shutil.move(src, dest)
+                else:
+                    shutil.copy2(src, dest)
+                succeeded += 1
+                self.result_paths.append(src)
+                self.moved_map[src] = dest
+                self._update_progress(i, f"{op}: {os.path.basename(dest)}")
+            except Exception as e:
+                failed += 1
+                errors.append(f"{os.path.basename(src)}: {e}")
+                self._update_progress(i, f"실패: {os.path.basename(src)}")
+
+        self.after(0, self._finish, op, succeeded, failed, skipped, errors)
+
+    def _update_progress(self, i, msg):
+        self.after(0, lambda: (
+            self.progress.configure(value=i),
+            self.progress_label.configure(text=f"[{i}/{len(self.file_paths)}] {msg[:60]}")
+        ))
+
+    def _finish(self, op, succeeded, failed, skipped, errors):
+        # 색인 갱신
+        if op == 'move':
+            for src, dest in self.moved_map.items():
+                try:
+                    self.index_mgr.update_path(src, dest)
+                except Exception:
+                    pass
+
+        self.run_btn.configure(state='normal')
+        verb = '이동' if op == 'move' else '복사'
+        msg = f"{verb} 완료 — 성공 {succeeded}, 실패 {failed}, 건너뜀 {skipped}"
+        self.progress_label.configure(text=msg)
+
+        if errors:
+            messagebox.showwarning(
+                "일부 실패",
+                f"{msg}\n\n실패 목록:\n" + "\n".join(errors[:10]) +
+                (f"\n... ({len(errors)-10}개 더 있음)" if len(errors) > 10 else ''),
+                parent=self
+            )
+        else:
+            messagebox.showinfo("완료", msg, parent=self)
+
+        if self.on_complete:
+            self.on_complete(op, self.result_paths, self.moved_map)
+
+    def _close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno("확인", "작업이 진행 중입니다. 중지하고 닫을까요?",
+                                       parent=self):
+                return
+            self.stop_flag.set()
+        self.destroy()
+
+
+# ============================================================
 # 메인 앱
 # ============================================================
 class FileFinderApp:
@@ -959,6 +1236,9 @@ class FileFinderApp:
         self.search_btn.pack(side='left', padx=(0, 6))
         self.stop_btn = ttk.Button(btn, text="■  중지", command=self._stop_search, state='disabled', width=10)
         self.stop_btn.pack(side='left')
+        ttk.Separator(btn, orient='vertical').pack(side='left', fill='y', padx=10)
+        self.move_btn = ttk.Button(btn, text="📁  선택 파일 이동/복사...", command=self._open_move_dialog, width=22)
+        self.move_btn.pack(side='left')
         ttk.Label(btn, text="  ·  Enter = 검색, Esc = 중지, 결과 더블클릭 = 탐색기에서 열기",
                   foreground='#888').pack(side='left', padx=(10, 0))
 
@@ -1047,6 +1327,8 @@ class FileFinderApp:
         self.menu.add_command(label="탐색기에서 열기", command=self._open_in_explorer)
         self.menu.add_command(label="파일 실행", command=self._open_file)
         self.menu.add_command(label="경로 복사", command=self._copy_path)
+        self.menu.add_separator()
+        self.menu.add_command(label="선택 파일 이동/복사...", command=self._open_move_dialog)
         self.tree.bind('<Button-3>', self._show_context_menu)
 
         status = ttk.Frame(self.root, padding=(12, 4))
@@ -1368,11 +1650,47 @@ class FileFinderApp:
     def _show_context_menu(self, event):
         row = self.tree.identify_row(event.y)
         if row:
-            self.tree.selection_set(row)
+            # 이미 선택된 여러 행이 있으면 유지, 아니면 이 행만 선택
+            if row not in self.tree.selection():
+                self.tree.selection_set(row)
             try:
                 self.menu.tk_popup(event.x_root, event.y_root)
             finally:
                 self.menu.grab_release()
+
+    # ===== 선택 파일 이동/복사 =====
+    def _get_selected_fullpaths(self):
+        paths = []
+        for item_id in self.tree.selection():
+            vals = self.tree.item(item_id, 'values')
+            if vals and len(vals) >= 2:
+                paths.append(os.path.join(vals[1], vals[0]))
+        return paths
+
+    def _open_move_dialog(self):
+        paths = self._get_selected_fullpaths()
+        if not paths:
+            messagebox.showinfo("알림", "먼저 결과 목록에서 파일을 선택하세요.")
+            return
+
+        def on_complete(op, processed_src_paths, moved_map):
+            # 이동 시 트리에서 해당 행 제거 (복사는 그대로 유지)
+            if op == 'move' and processed_src_paths:
+                src_set = set(os.path.normcase(p) for p in processed_src_paths)
+                for item_id in list(self.tree.get_children()):
+                    vals = self.tree.item(item_id, 'values')
+                    if vals and len(vals) >= 2:
+                        full = os.path.join(vals[1], vals[0])
+                        if os.path.normcase(full) in src_set:
+                            self.tree.delete(item_id)
+                self.status_var.set(
+                    f"이동 완료 — {len(processed_src_paths)}개 파일. "
+                    "색인을 쓰신다면 '색인 관리 > 증분 업데이트'를 권장합니다."
+                )
+            elif op == 'copy' and processed_src_paths:
+                self.status_var.set(f"복사 완료 — {len(processed_src_paths)}개 파일")
+
+        MoveCopyDialog(self.root, paths, self.index_mgr, on_complete=on_complete)
 
     # ===== 미리보기 =====
     IMAGE_EXTS = {'png', 'gif', 'jpg', 'jpeg', 'bmp', 'webp', 'tiff', 'tif', 'ico'}
