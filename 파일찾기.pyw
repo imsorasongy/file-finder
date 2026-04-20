@@ -270,6 +270,28 @@ def extract_preview_text(filepath, max_bytes):
     return None
 
 
+def render_pdf_first_page_as_image(filepath, zoom=2.0):
+    """스캔 PDF 등 텍스트 없는 PDF를 위한 첫 페이지 이미지 렌더링. PIL.Image 반환."""
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+        import io
+        doc = fitz.open(filepath)
+        if len(doc) == 0:
+            doc.close()
+            return None
+        page = doc[0]
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        img = Image.open(io.BytesIO(img_bytes))
+        img.load()
+        return img
+    except Exception:
+        return None
+
+
 def find_snippet(text, query, case_sensitive, ctx_before=40, ctx_after=80):
     if not text or not query:
         return None
@@ -1421,6 +1443,16 @@ class FileFinderApp:
         # 1단계: 빠른 미리보기 (앞 페이지/섹션만)
         text = extract_preview_text(fp, max_bytes)
         is_partial = True
+
+        # PDF: 텍스트가 너무 적으면 스캔 PDF로 간주 → 이미지 렌더링
+        if ext == 'pdf' and (text is None or len(text.strip()) < 50):
+            img = render_pdf_first_page_as_image(fp)
+            if img is not None:
+                meta = f"PDF · 스캔/이미지 기반 · {self._fmt_size(st.st_size)}  ·  첫 페이지"
+                if token != self._preview_token:
+                    return
+                self.root.after(0, self._preview_show_image, fp, img, meta, token)
+                return
 
         # 검색어 목록
         queries = []
