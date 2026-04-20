@@ -293,6 +293,89 @@ def render_pdf_first_page_as_image(filepath, zoom=2.0):
         return None
 
 
+def search_zip_entries(zip_path, name_q, content_q, case_sensitive, exts, max_bytes):
+    """ZIP 파일 내부 엔트리를 검색. 매치된 엔트리 리스트 반환 (또는 None on error)."""
+    import zipfile
+    import tempfile
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            matches = []
+            name_q_cmp = name_q if case_sensitive else name_q.lower()
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                entry_path = info.filename
+                entry_name = entry_path.rsplit('/', 1)[-1] if '/' in entry_path else entry_path
+                ext = entry_name.rsplit('.', 1)[-1].lower() if '.' in entry_name else ''
+
+                # 파일명 필터
+                if name_q:
+                    cmp_name = entry_name if case_sensitive else entry_name.lower()
+                    if name_q_cmp not in cmp_name:
+                        continue
+                # 확장자 필터
+                if exts is not None and ext not in exts:
+                    continue
+                # 크기 제한
+                if info.file_size > max_bytes:
+                    if content_q:
+                        continue
+                    # 이름만 검색이면 통과
+
+                snippet = ''
+                # 내용 검색
+                if content_q:
+                    if ext in BINARY_SKIP_EXTENSIONS:
+                        continue
+                    try:
+                        data = zf.read(info)
+                    except Exception:
+                        continue
+                    # 임시 파일로 추출해 기존 파서 재사용
+                    tmp_path = None
+                    try:
+                        suffix = f'.{ext}' if ext else ''
+                        with tempfile.NamedTemporaryFile(
+                            suffix=suffix, delete=False
+                        ) as tmp:
+                            tmp.write(data)
+                            tmp_path = tmp.name
+                        text = extract_text_from_file(tmp_path, max_bytes)
+                        if text is None:
+                            continue
+                        snippet = find_snippet(text, content_q, case_sensitive) or ''
+                        if not snippet:
+                            continue
+                    except Exception:
+                        continue
+                    finally:
+                        if tmp_path:
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+
+                # mtime (zipfile date_time tuple)
+                try:
+                    dt = datetime.datetime(*info.date_time)
+                    mtime = dt.timestamp()
+                except (ValueError, TypeError):
+                    mtime = 0
+
+                matches.append({
+                    'entry_path': entry_path,
+                    'size': info.file_size,
+                    'mtime': mtime,
+                    'snippet': snippet,
+                })
+                if len(matches) >= 200:
+                    break
+            return matches
+    except (zipfile.BadZipFile, OSError, Exception):
+        return None
+
+
 def find_snippet(text, query, case_sensitive, ctx_before=40, ctx_after=80):
     if not text or not query:
         return None
@@ -1212,6 +1295,8 @@ class FileFinderApp:
         ttk.Checkbutton(opt, text="대소문자 구분", variable=self.case_var).pack(side='left', padx=(14, 0))
         self.skip_hidden_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="숨김/시스템 폴더 제외", variable=self.skip_hidden_var).pack(side='left', padx=(14, 0))
+        self.zip_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="📦 ZIP 내부까지 검색", variable=self.zip_var).pack(side='left', padx=(14, 0))
         ttk.Label(opt, text="  |  내용 검색 최대 파일 크기 (MB)").pack(side='left', padx=(14, 2))
         self.maxsize_var = tk.StringVar(value="20")
         ttk.Entry(opt, textvariable=self.maxsize_var, width=5).pack(side='left')
@@ -1464,6 +1549,7 @@ class FileFinderApp:
         subdir = self.subdir_var.get()
         case_sensitive = self.case_var.get()
         skip_hidden = self.skip_hidden_var.get()
+        zip_search = self.zip_var.get()
         max_bytes = int(max_mb * 1024 * 1024)
 
         name_q_cmp = name_q if case_sensitive else name_q.lower()
@@ -1495,31 +1581,62 @@ class FileFinderApp:
                         break
                     scanned += 1
                     fname_cmp = f if case_sensitive else f.lower()
+                    fext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
+
+                    # 일반 파일 매치 여부 판정
+                    regular_match = True
                     if name_q and name_q_cmp not in fname_cmp:
-                        continue
-                    if exts is not None:
-                        fext = f.rsplit('.', 1)[-1].lower() if '.' in f else ''
-                        if fext not in exts:
-                            continue
+                        regular_match = False
+                    if regular_match and exts is not None and fext not in exts:
+                        regular_match = False
+
                     fpath = os.path.join(root_dir, f)
-                    try:
-                        st = os.stat(fpath)
-                    except OSError:
-                        continue
+
+                    if regular_match:
+                        try:
+                            st = os.stat(fpath)
+                        except OSError:
+                            regular_match = False
+
                     snippet = ''
-                    if content_q:
+                    if regular_match and content_q:
                         content_scanned += 1
                         if content_scanned % 5 == 0 or st.st_size > 1_000_000:
                             self.root.after(0, self._status_now,
                                             f"내용 검색 중 · {f[:60]}", scanned, count)
                         text = extract_text_from_file(fpath, max_bytes)
                         if text is None:
-                            continue
-                        snippet = find_snippet(text, content_q, case_sensitive)
-                        if not snippet:
-                            continue
-                    self.results.append((f, root_dir, st.st_size, st.st_mtime, snippet))
-                    count += 1
+                            regular_match = False
+                        else:
+                            snippet = find_snippet(text, content_q, case_sensitive)
+                            if not snippet:
+                                regular_match = False
+
+                    if regular_match:
+                        self.results.append((f, root_dir, st.st_size, st.st_mtime, snippet))
+                        count += 1
+
+                    # ZIP 내부 검색 (옵션)
+                    if zip_search and fext == 'zip':
+                        self.root.after(
+                            0, self._status_now,
+                            f"ZIP 스캔 · {f[:60]}", scanned, count
+                        )
+                        entries = search_zip_entries(
+                            fpath, name_q, content_q, case_sensitive, exts, max_bytes
+                        )
+                        if entries:
+                            for ent in entries:
+                                if self.stop_flag.is_set():
+                                    break
+                                display_name = f"{f} ▶ {ent['entry_path']}"
+                                snip = ent['snippet'] or f"ZIP 내부: {ent['entry_path']}"
+                                self.results.append((
+                                    display_name, root_dir,
+                                    ent['size'], ent['mtime'], snip
+                                ))
+                                count += 1
+
                     flush_every = 10 if content_q else 30
                     if count % flush_every == 0:
                         self.root.after(0, self._flush_and_status, scanned, count)
@@ -1608,13 +1725,18 @@ class FileFinderApp:
             self.tree.move(k, '', idx)
 
     def _selected_fullpath(self):
+        """선택 행의 물리 파일 경로. ZIP 엔트리면 부모 ZIP 경로를 반환."""
         sel = self.tree.selection()
         if not sel:
             return None
         vals = self.tree.item(sel[0], 'values')
         if not vals:
             return None
-        return os.path.join(vals[1], vals[0])
+        name = vals[0]
+        if ' ▶ ' in name:
+            zip_name = name.split(' ▶ ', 1)[0]
+            return os.path.join(vals[1], zip_name)
+        return os.path.join(vals[1], name)
 
     def _open_in_explorer(self, event=None):
         fp = self._selected_fullpath()
